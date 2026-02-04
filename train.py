@@ -202,7 +202,6 @@ def main(args):
         drop_last=True
     )
     logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
-    logger.info(f"LWF_Dataset contains {len(lwf_dataset):,} images ({args.lwf_step})")
 
     # Prepare models for training:
     update_ema(ema, model, decay=0)  # Ensure EMA is initialized with synced weights
@@ -349,7 +348,7 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-every", type=int, default=24000)
     parser.add_argument("--max-steps", type=int, default=24000)
     
-    parser.add_argument("--y-embed-mode", type=str, choices=["scratch", "LWF", "default"], default="default")
+    parser.add_argument("--y-embed-mode", type=str, choices=["scratch", "LWF", "default"], default="LWF")
     parser.add_argument("--LWF-ratio", type=float, default=0.2)
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a DiT checkpoint (default: auto-download a pre-trained DiT-XL/2 model).")
