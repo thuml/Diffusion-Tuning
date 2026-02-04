@@ -199,6 +199,13 @@ class GaussianDiffusion:
         self.posterior_mean_coef2 = (
             (1.0 - self.alphas_cumprod_prev) * np.sqrt(alphas) / (1.0 - self.alphas_cumprod)
         )
+        self.p2_gamma = 0.5
+        self.p2_k = 1
+        self.snr = 1.0 / (1 - self.alphas_cumprod) - 1 
+        # for t in range(1,11):
+        #     i = t*100-1
+        #     print(f"SNR at {i}th timestep: {self.snr[i]}, beta: {betas[i]}, P2: {1 / (self.p2_k + self.snr[i])**self.p2_gamma}, ")
+
 
     def q_mean_variance(self, x_start, t):
         """
@@ -488,13 +495,63 @@ class GaussianDiffusion:
         else:
             img = th.randn(*shape, device=device)
         indices = list(range(self.num_timesteps))[::-1]
-
+        # print(indices)
         if progress:
             # Lazy import so that we don't depend on tqdm.
             from tqdm.auto import tqdm
 
             indices = tqdm(indices)
+        
+        for i in indices:
+            t = th.tensor([i] * shape[0], device=device)
+            with th.no_grad():
+                out = self.p_sample(
+                    model,
+                    img,
+                    t,
+                    clip_denoised=clip_denoised,
+                    denoised_fn=denoised_fn,
+                    cond_fn=cond_fn,
+                    model_kwargs=model_kwargs,
+                )
+                yield out
+                img = out["sample"]
 
+    def p_sample_loop_from_middle_progressive(
+        self,
+        model,
+        shape,
+        cur_t,
+        noise=None,
+        clip_denoised=True,
+        denoised_fn=None,
+        cond_fn=None,
+        model_kwargs=None,
+        device=None,
+        progress=False,
+    ):
+        """
+        Generate samples from the model and yield intermediate samples from
+        each timestep of diffusion.
+        Arguments are the same as p_sample_loop().
+        Returns a generator over dicts, where each dict is the return value of
+        p_sample().
+        """
+        if device is None:
+            device = next(model.parameters()).device
+        assert isinstance(shape, (tuple, list))
+        if noise is not None:
+            img = noise
+        else:
+            img = th.randn(*shape, device=device)
+        indices = list(range(cur_t))[::-1]
+        # print(indices)
+        if progress:
+            # Lazy import so that we don't depend on tqdm.
+            from tqdm.auto import tqdm
+
+            indices = tqdm(indices)
+        
         for i in indices:
             t = th.tensor([i] * shape[0], device=device)
             with th.no_grad():
@@ -711,8 +768,84 @@ class GaussianDiffusion:
         # otherwise return KL(q(x_{t-1}|x_t,x_0) || p(x_{t-1}|x_t))
         output = th.where((t == 0), decoder_nll, kl)
         return {"output": output, "pred_xstart": out["pred_xstart"]}
+    
+    def training_kd_losses(self, model, kd_model, x_start, t, model_kwargs=None, noise=None, P2_weighting=False):
+        """
+        mimic training loss
+        """
+        if model_kwargs is None:
+            model_kwargs = {}
+        if noise is None:
+            noise = th.randn_like(x_start)
+        x_t = self.q_sample(x_start, t, noise=noise)
 
-    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None):
+        terms = {}
+
+        if self.loss_type == LossType.KL or self.loss_type == LossType.RESCALED_KL:
+            terms["loss"] = self._vb_terms_bpd(
+                model=model,
+                x_start=x_start,
+                x_t=x_t,
+                t=t,
+                clip_denoised=False,
+                model_kwargs=model_kwargs,
+            )["output"]
+            if self.loss_type == LossType.RESCALED_KL:
+                terms["loss"] *= self.num_timesteps
+        elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
+            model_output = model(x_t, t, **model_kwargs)
+            kd_target = kd_model(x_t, t, **model_kwargs)
+            # print("shape1:", model_output.shape, kd_target.shape)
+            # print("model_var_type", self.model_var_type)
+            # if self.model_var_type in [
+            #     ModelVarType.LEARNED,
+            #     ModelVarType.LEARNED_RANGE,
+            # ]:
+            #     B, C = x_t.shape[:2]
+            #     assert model_output.shape == (B, C * 2, *x_t.shape[2:])
+            #     model_output, model_var_values = th.split(model_output, C, dim=1)
+            #     # Learn the variance using the variational bound, but don't let
+            #     # it affect our mean prediction.
+            #     frozen_out = th.cat([model_output.detach(), model_var_values], dim=1)
+            #     terms["vb"] = self._vb_terms_bpd(
+            #         model=lambda *args, r=frozen_out: r,
+            #         x_start=x_start,
+            #         x_t=x_t,
+            #         t=t,
+            #         clip_denoised=False,
+            #     )["output"]
+            #     if self.loss_type == LossType.RESCALED_MSE:
+            #         # Divide by 1000 for equivalence with initial implementation.
+            #         # Without a factor of 1/1000, the VB term hurts the MSE term.
+            #         terms["vb"] *= self.num_timesteps / 1000.0
+            #     print("shape2:", model_output.shape, kd_target.shape)
+
+            target = {
+                ModelMeanType.PREVIOUS_X: self.q_posterior_mean_variance(
+                    x_start=x_start, x_t=x_t, t=t
+                )[0],
+                ModelMeanType.START_X: x_start,
+                ModelMeanType.EPSILON: noise,
+            }[self.model_mean_type]
+            # assert model_output.shape == target.shape == x_start.shape
+            # print("shape:", model_output.shape, kd_target.shape)
+
+            if P2_weighting:
+                weight = _extract_into_tensor(1 / (self.p2_k + self.snr)**self.p2_gamma, t, target.shape)
+                terms["mse"] = mean_flat(weight * (kd_target - model_output) ** 2)
+            else:
+                terms["mse"] = mean_flat((kd_target - model_output) ** 2)
+            if "vb" in terms:
+                terms["loss"] = terms["mse"] + terms["vb"]
+            else:
+                terms["loss"] = terms["mse"]
+        else:
+            raise NotImplementedError(self.loss_type)
+
+        return terms
+        
+    
+    def training_losses(self, model, x_start, t, model_kwargs=None, noise=None, P2_weighting=False, MIN_SNR=-1):
         """
         Compute training losses for a single timestep.
         :param model: the model to evaluate loss on.
@@ -776,7 +909,14 @@ class GaussianDiffusion:
                 ModelMeanType.EPSILON: noise,
             }[self.model_mean_type]
             assert model_output.shape == target.shape == x_start.shape
-            terms["mse"] = mean_flat((target - model_output) ** 2)
+            if P2_weighting:
+                weight = _extract_into_tensor(1 / (self.p2_k + self.snr)**self.p2_gamma, t, target.shape)
+                terms["mse"] = mean_flat(weight * (target - model_output) ** 2)
+            elif MIN_SNR >= 0:
+                weight = _extract_into_tensor(np.minimum(MIN_SNR, self.snr), t, target.shape)
+                terms["mse"] = mean_flat(weight * (target - model_output) ** 2)
+            else:
+                terms["mse"] = mean_flat((target - model_output) ** 2)
             if "vb" in terms:
                 terms["loss"] = terms["mse"] + terms["vb"]
             else:

@@ -353,7 +353,7 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a DiT checkpoint (default: auto-download a pre-trained DiT-XL/2 model).")
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--t_prob", type=str, choices=["uniform","categorical"])
+    parser.add_argument("--t_prob", type=str, choices=["uniform","categorical"], default='categorical')
     parser.add_argument("--prob-scale", type=float, default=1.0)
     parser.add_argument("--mask-trick", action='store_true', help="Use DiffFit instead of DiT")
 
